@@ -1,0 +1,911 @@
+---
+title: "CRISPR Tiling Analysis"
+author: "Samantha Schuster"
+date: "2023-08-03"
+output: html_document
+---
+
+libraries
+```{r message=FALSE, warning=FALSE}
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(GenomicFeatures)
+library(org.Hs.eg.db)
+library(annotate)
+library(plyr)
+library(ggrepel)
+library(scales)
+library(ggbreak)
+library(gggenomes)
+library(tidyverse)
+library(biomaRt)
+library(egg)
+library(ggh4x)
+
+library(GenomicScores)
+library(GenomicAlignments)
+library(phastCons100way.UCSC.hg38)
+library(VariantAnnotation)
+```
+
+Set up (run once)
+```{r message=FALSE, warning=FALSE}
+#info for mapping gene names
+mrt <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+symb <- keys(org.Hs.eg.db, "SYMBOL")
+ensembl_map_2 <- getBM(c("hgnc_symbol", "ensembl_gene_id", "ensembl_gene_id_version", "entrezgene_id", "chromosome_name"), "hgnc_symbol", symb, mrt)
+ensembl_map <- getBM(c("hgnc_symbol", "ensembl_gene_id", "ensembl_gene_id_version", "entrezgene_id"), "hgnc_symbol", symb, mrt)
+
+#transcript info: GENCODE V43 using ALL transcripts
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene #load genome you're interested in
+cds <- cdsBy(txdb, "tx")
+threeUTR <- threeUTRsByTranscript(txdb)
+fiveUTR <- fiveUTRsByTranscript(txdb)
+
+#transcript info: GENCODE V43 using BASIC transcripts
+##this was downloaded from https://www.gencodegenes.org/human/, specifically the "Basic gene annotation" file on the reference chromosomes only
+basic_txdb <- makeTxDbFromGFF(file = "gencode.v43.basic.annotation.gff3.gz", organism = "Homo sapiens")
+cds_b <- cdsBy(basic_txdb, "tx")
+threeUTR_b <- threeUTRsByTranscript(basic_txdb)
+fiveUTR_b <- fiveUTRsByTranscript(basic_txdb)
+
+#grab CRISPR data
+sgRNA_coordinate <- read_csv("Master_file_guides.csv")
+test1_20D <- read_csv("test1_20D.csv")
+test1_master <- left_join(test1_20D, sgRNA_coordinate, by = c("guideName" = "id")) %>%
+  rowwise() %>% mutate(logFC = -logFC) %>%
+  mutate(cpm_0D_avg = mean(c(cpm_test1_0D_1_S16, cpm_test1_0D_2_S17, cpm_test1_0D_3_S18)),
+         raw_0D_avg = mean(c(raw_test1_0D_1_S16, raw_test1_0D_2_S17, raw_test1_0D_3_S18))) %>% ungroup()
+test2_20D <- read_csv("test2_20D.csv")
+test2_master <- left_join(test2_20D, sgRNA_coordinate, by = c("guideName" = "id")) %>%
+  rowwise() %>% mutate(logFC = -logFC) %>% 
+  mutate(cpm_0D_avg = mean(c(`cpm_test2_MB-231_0D_3_S3`, `cpm_test2_MB-231_0D_1_S1`, `cpm_test2_MB-231_0D_2_S2`)), 
+         raw_0D_avg = mean(c(`raw_test2_MB-231_0D_3_S3`, `raw_test2_MB-231_0D_1_S1`, `raw_test2_MB-231_0D_2_S2`))) %>% ungroup()
+test3_20D <- read_csv("test3_20D.csv")
+test3_master <- left_join(test3_20D, sgRNA_coordinate, by = c("guideName" = "id")) %>%
+  rowwise() %>% mutate(logFC = -logFC) %>% 
+  mutate(cpm_0D_avg = mean(c(cpm_test3_0D_1_S16, cpm_test3_0D_2_S17, cpm_test3_0D_3_S18)), 
+         raw_0D_avg = mean(c(raw_test3_0D_1_S16, raw_test3_0D_2_S17, raw_test3_0D_3_S18))) %>% ungroup()
+test4_20D <- read_csv("test4_20D.csv")
+test4_master <- left_join(test4_20D, sgRNA_coordinate, by = c("guideName" = "id")) %>%
+  rowwise() %>% mutate(logFC = -logFC) %>% 
+  mutate(cpm_0D_avg = mean(c(cpm_test4_0D_1_S1, cpm_test4_0D_2_S2, cpm_test4_0D_3_S3)), 
+         raw_0D_avg = mean(c(raw_test4_0D_1_S1, raw_test4_0D_2_S2, raw_test4_0D_3_S3))) %>% ungroup()
+
+#for RNAseq coverage
+bamfls = list.files(path = "rnaseq_test_nos/star2_bam_hg38/bam_files", full.names=T, pattern ="bam$")
+```
+
+
+FOR DOING ANALYSIS GENE BY GENE:
+
+Set Gene of Interest
+```{r}
+goi <- "HIF1A" #put gene of interest here
+
+entrez_id <- ensembl_map %>% filter(hgnc_symbol == goi) %>% pull(entrezgene_id)
+ensembl_id <- ensembl_map %>% filter(hgnc_symbol == goi) %>% pull(ensembl_gene_id)
+```
+
+Run this to get ALL & BASIC transcript maps for gene of interest above
+```{r}
+###TRANSCRIPT INFO: ALL TRANSCRIPTS###
+
+##set up df of cds/intron/exon coordinates to start
+all_id <- as.character(entrez_id) #put ENTREZ ID of whatever gene you want here MYC=4609, AR=367
+all_tx <- transcriptsBy(txdb, by = "gene")[[all_id]]
+all_tx_id <- mcols(all_tx)$tx_id
+all_tx_names <- as.data.frame(all_tx)[,6:7]
+
+all_exons <- exonsBy(txdb, "tx")[all_tx_id]
+all_introns <- intronsByTranscript(txdb)[all_tx_id]
+all_exin <- bind_rows(as.data.frame(all_exons) %>% mutate(type="exon"), as.data.frame(all_introns) %>% mutate(type="intron")) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand, type)
+
+all_cds <- as.data.frame(cds[names(cds) %in% all_tx_id]) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+  mutate(type = "CDS")
+all_3utr <- as.data.frame(threeUTR[names(threeUTR) %in% all_tx_id]) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+  mutate(type = "utr3")
+all_5utr <- as.data.frame(fiveUTR[names(fiveUTR) %in% all_tx_id]) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+  mutate(type = "utr5")
+all_txinfo <- bind_rows(all_cds, all_3utr, all_5utr, all_exin) %>%
+  dplyr::select(group_name, start, end, strand, type) %>%
+  rowwise %>%
+  mutate(seq_id = all_tx_names %>% filter(tx_id == group_name) %>% pull(tx_name))
+
+
+##now make gene, mRNA, cds, exon rows as correct for gggenomes
+#make exon rows: each exon for each seq_id is a separate row, no intron info
+ggall_exons <- all_txinfo %>% filter(type=="exon") %>% mutate(introns = NA)
+
+#make cds rows: one row for each seq_id that has the total CDS length used by that seq_id, and the introns relative to the CDS start position
+ggall_cds <- all_txinfo %>% filter(type=="CDS") %>%
+  group_by(seq_id) %>%
+  summarize(start=min(start), 
+            end=max(end), 
+            strand=strand[1], 
+            type="CDS")
+##adding introns to cds df
+cds_df <- NULL
+for (i in 1:nrow(ggall_cds)) {
+  df <- ggall_cds
+  seq_i <- df$seq_id[i]
+  start <- df$start[i]
+  end <- df$end[i]
+  cds_width <- end-start
+  introns_start <- all_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(start)
+  introns_end <- all_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(end)
+  introns <- c(introns_start, introns_end) - start
+  introns <- introns[introns>=0]
+  introns <- introns[introns<=cds_width]
+  introns <- sort(introns)
+  
+  new_row <- tibble(
+    seq_id = seq_i, 
+    start=start, 
+    end=end, 
+    introns = list(introns), 
+    strand=df$strand[i], 
+    type="CDS"
+  )
+  cds_df <- rbind(cds_df, new_row)
+}
+ggall_cds <- cds_df
+
+#make mRNA row: one row for each seq_id that has the total mRNA length used by that seq_id, as defined by the exons, and the introns relative to the mRNA start position
+ggall_mRNA <- all_txinfo %>% filter(type=="exon") %>%
+  group_by(seq_id) %>%
+  summarize(start=min(start), 
+            end=max(end), 
+            strand=strand[1], 
+            type="mRNA")
+##adding introns to mRNA df
+mRNA_df <- NULL
+for (i in 1:nrow(ggall_mRNA)) {
+  df <- ggall_mRNA
+  seq_i <- df$seq_id[i]
+  start <- df$start[i]
+  end <- df$end[i]
+  introns_start <- all_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(start)
+  introns_end <- all_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(end)
+  introns <- c(introns_start, introns_end) - start
+  introns <- introns[introns>=0]
+  introns <- sort(introns)
+  
+  new_row <- tibble(
+    seq_id = seq_i, 
+    start=start, 
+    end=end, 
+    introns = list(introns), 
+    strand=df$strand[i], 
+    type="mRNA"
+  )
+  mRNA_df <- rbind(mRNA_df, new_row)
+}
+ggall_mRNA <- mRNA_df
+
+#make gene row: one row for each seq_id, but all have the same total length/size (essentially setting the x-axis)
+ggall_gene <- all_txinfo %>%
+  group_by(strand) %>%
+  summarize(start=min(start), 
+            end=max(end), 
+            strand=strand[1], 
+            type="gene",
+            introns=NA)
+ggall_gene <- do.call("rbind", replicate(length(unique(all_txinfo$seq_id)),ggall_gene, simplify = FALSE)) %>%
+  mutate(seq_id = unique(all_txinfo$seq_id))
+
+##put together for gggenomes
+ggall <- rbind(ggall_gene, ggall_mRNA, ggall_cds, ggall_exons %>% dplyr::select(-group_name))
+
+
+###BASIC TRANSCRIPTS###
+
+##set up df of cds/intron/exon coordinates to start
+gene_id <- grep(ensembl_id, names(transcriptsBy(basic_txdb, by="gene")), value=TRUE)
+basic_tx <- transcriptsBy(basic_txdb, by = "gene")[[gene_id]]
+basic_tx_id <- mcols(basic_tx)$tx_id
+basic_tx_names <- as.data.frame(basic_tx)[,6:7]
+
+basic_exons <- exonsBy(basic_txdb, "tx")[basic_tx_id]
+basic_introns <- intronsByTranscript(basic_txdb)[basic_tx_id]
+basic_exin <- bind_rows(as.data.frame(basic_exons) %>% mutate(type="exon"), as.data.frame(basic_introns) %>% mutate(type="intron")) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand, type)
+
+basic_cds <- as.data.frame(cds_b[names(cds_b) %in% basic_tx_id]) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+  mutate(type = "CDS")
+basic_3utr <- as.data.frame(threeUTR_b[names(threeUTR_b) %in% basic_tx_id]) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+  mutate(type = "utr3")
+basic_5utr <- as.data.frame(fiveUTR_b[names(fiveUTR_b) %in% basic_tx_id]) %>%
+  dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+  mutate(type = "utr5")
+basic_txinfo <- bind_rows(basic_cds, basic_3utr, basic_5utr, basic_exin) %>%
+  dplyr::select(group_name, start, end, strand, type) %>%
+  rowwise %>%
+  mutate(seq_id = basic_tx_names %>% filter(tx_id == group_name) %>% pull(tx_name))
+
+
+##now make gene, mRNA, cds, exon rows as correct for gggenomes
+#make exon rows: each exon for each seq_id is a separate row, no intron info
+ggbasic_exons <- basic_txinfo %>% filter(type=="exon") %>% mutate(introns = NA)
+
+#make cds rows: one row for each seq_id that has the total CDS length used by that seq_id, and the introns relative to the CDS start position
+ggbasic_cds <- basic_txinfo %>% filter(type=="CDS") %>%
+  group_by(seq_id) %>%
+  summarize(start=min(start), 
+            end=max(end), 
+            strand=strand[1], 
+            type="CDS")
+##adding introns to cds df
+cds_df <- NULL
+for (i in 1:nrow(ggbasic_cds)) {
+  df <- ggbasic_cds
+  seq_i <- df$seq_id[i]
+  start <- df$start[i]
+  end <- df$end[i]
+  cds_width <- end-start
+  introns_start <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(start)
+  introns_end <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(end)
+  introns <- c(introns_start, introns_end) - start
+  introns <- introns[introns>=0]
+  introns <- introns[introns<=cds_width]
+  introns <- sort(introns)
+  
+  new_row <- tibble(
+    seq_id = seq_i, 
+    start=start, 
+    end=end, 
+    introns = list(introns), 
+    strand=df$strand[i], 
+    type="CDS"
+  )
+  cds_df <- rbind(cds_df, new_row)
+}
+ggbasic_cds <- cds_df
+
+#make mRNA row: one row for each seq_id that has the total mRNA length used by that seq_id, as defined by the exons, and the introns relative to the mRNA start position
+ggbasic_mRNA <- basic_txinfo %>% filter(type=="exon") %>%
+  group_by(seq_id) %>%
+  summarize(start=min(start), 
+            end=max(end), 
+            strand=strand[1], 
+            type="mRNA")
+##adding introns to mRNA df
+mRNA_df <- NULL
+for (i in 1:nrow(ggbasic_mRNA)) {
+  df <- ggbasic_mRNA
+  seq_i <- df$seq_id[i]
+  start <- df$start[i]
+  end <- df$end[i]
+  introns_start <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(start)
+  introns_end <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(end)
+  introns <- c(introns_start, introns_end) - start
+  introns <- introns[introns>=0]
+  introns <- sort(introns)
+  
+  new_row <- tibble(
+    seq_id = seq_i, 
+    start=start, 
+    end=end, 
+    introns = list(introns), 
+    strand=df$strand[i], 
+    type="mRNA"
+  )
+  mRNA_df <- rbind(mRNA_df, new_row)
+}
+ggbasic_mRNA <- mRNA_df
+
+#make gene row: one row for each seq_id, but all have the same total length/size (essentially setting the x-axis)
+ggbasic_gene <- basic_txinfo %>%
+  group_by(strand) %>%
+  summarize(start=min(start), 
+            end=max(end), 
+            strand=strand[1], 
+            type="gene",
+            introns=NA)
+ggbasic_gene <- do.call("rbind", replicate(length(unique(basic_txinfo$seq_id)),ggbasic_gene, simplify = FALSE)) %>%
+  mutate(seq_id = unique(basic_txinfo$seq_id))
+
+##put together for gggenomes
+ggbasic <- rbind(ggbasic_gene, ggbasic_mRNA, ggbasic_cds, ggbasic_exons %>% dplyr::select(-group_name))
+
+
+###GRAPHING: ALL TRANSCRIPTS###
+
+#set up x axis
+gg_start_a <- min(ggall$start)
+gg_end_a <- max(ggall$end)
+gg_width_a <- gg_end_a-gg_start_a
+#set where along the x-axis you want ticks to show based on range
+if(between(gg_width_a, 1000, 10000)){
+  gg_st_a <-round_any(gg_start_a, 1000, f=floor)
+  gg_e_a <- round_any(gg_end_a, 1000, f=ceiling)
+  gg_by_a <- 1000} else if(between(gg_width_a, 1, 1000)){
+  gg_st_a <-round_any(gg_start_a, 100, f=floor)
+  gg_e_a <- round_any(gg_end_a, 100, f=ceiling)
+  gg_by_a <- 100} else if(between(gg_width_a, 10000, 100000)){
+  gg_st_a <-round_any(gg_start_a, 10000, f=floor)
+  gg_e_a <- round_any(gg_end_a, 10000, f=ceiling)
+  gg_by_a <- 10000} else if(between(gg_width_a, 100000, 500000)){
+  gg_st_a <- round_any(gg_start_a, 100000, f=floor)
+  gg_e_a <- round_any(gg_end_a, 100000, f=ceiling)
+  gg_by_a <- 50000}
+gg_breaks_a <- seq(from=gg_st_a, to=gg_e_a, by=gg_by_a)
+#format the x-axis ticks as proper coordinates instead of 0-based values
+gg_labels_a <- paste0(as.character(all_tx@seqnames[1]),":", format(gg_breaks_a, big.mark=",",scientific=FALSE)) 
+#0-based gggenomes coordinates for x axis limits/breaks
+gg_xstart_a <- gg_breaks_a[1] - gg_start_a
+gg_xend_a <- tail(gg_breaks_a,1) - gg_breaks_a[1] + gg_xstart_a
+
+gggenomes(genes=ggall) +
+  geom_seq_label() +
+  geom_gene(size=3, intron_shape = c(4,4), 
+            cds_aes = aes(fill="midnightblue"), 
+            rna_aes = aes(fill="palegreen3", alpha=0.5),
+            rna_size = 2) +
+  labs(title=paste(lookUp(all_id, "org.Hs.eg", "SYMBOL")[[1]], "All Transcripts"), y="Transcript IDs", x="chr8 position") +
+#  coord_cartesian(c(gg_xstart, gg_xend)) + 
+  scale_x_continuous(breaks=seq(from=gg_xstart_a, to=gg_xend_a, by=gg_by_a), #if you want to have fewer breaks (too crowded), then just put by=gg_by*2/4/etc here and gg_breaks line
+                     labels=gg_labels_a)
+#ggsave("AR_all_transcripts_23-08-25.tiff")
+
+
+###GRAPHING: BASIC TRANSCRIPTS###
+
+#set up x axis
+gg_start_b <- min(ggbasic$start)
+gg_end_b <- max(ggbasic$end)
+gg_width_b <- gg_end_b-gg_start_b
+#set where along the x-axis you want ticks to show based on range
+if(between(gg_width_b, 1000, 10000)){
+  gg_st_b <-round_any(gg_start_b, 1000, f=floor)
+  gg_e_b <- round_any(gg_end_b, 1000, f=ceiling)
+  gg_by_b <- 1000} else if(between(gg_width_b, 1, 1000)){
+  gg_st_b <-round_any(gg_start_b, 100, f=floor)
+  gg_e_b <- round_any(gg_end_b, 100, f=ceiling)
+  gg_by_b <- 100} else if(between(gg_width_b, 10000, 100000)){
+  gg_st_b <-round_any(gg_start_b, 10000, f=floor)
+  gg_e_b <- round_any(gg_end_b, 10000, f=ceiling)
+  gg_by_b <- 10000} else if(between(gg_width_b, 100000, 500000)){
+  gg_st_b <- round_any(gg_start_b, 100000, f=floor)
+  gg_e_b <- round_any(gg_end_b, 100000, f=ceiling)
+  gg_by_b <- 50000}
+gg_breaks_b <- seq(from=gg_st_b, to=gg_e_b, by=gg_by_b)
+#format the x-axis ticks as proper coordinates instead of 0-based values
+gg_labels_b <- paste0(as.character(basic_tx@seqnames[1]),":", format(gg_breaks_b, big.mark=",",scientific=FALSE)) 
+#0-based gggenomes coordinates for x axis limits/breaks
+gg_xstart_b <- gg_breaks_b[1] - gg_start_b
+gg_xend_b <- tail(gg_breaks_b,1) - gg_breaks_b[1] + gg_xstart_b
+
+gggenomes(genes=ggbasic, feats=) +
+  geom_seq_label() +
+  geom_gene(size=3, intron_shape = c(4,4), 
+            cds_aes = aes(fill="midnightblue"), 
+            rna_aes = aes(fill="palegreen3", alpha=0.5),
+            rna_size = 2) +
+  labs(title=paste(goi, "Basic Transcripts"), y="Transcript IDs", x="chr8 position")
+#  coord_cartesian(c(gg_xstart, gg_xend)) + 
+  #scale_x_continuous(breaks=seq(from=gg_xstart_b, to=gg_xend_b, by=gg_by_b), #if you want to have fewer breaks (too crowded), then just put by=gg_by*2/4/etc here and gg_breaks line
+                     #labels=gg_labels_b)
+#ggsave("AR_basic_transcripts_23-08-25.tiff")
+```
+
+Combine graphing test1 CRISPR data with transcript map
+```{r}
+#filter CRISPR data for gene of interest & set up df for graphing
+test1_GOI <- test1_master %>%
+  filter(geneName == goi) %>%
+  mutate(log10FDR =-log10(FDR))
+test1_GOI$brks <- cut(test1_GOI$log10FDR, 
+               breaks=c(0,1.3,4,10, 20, 30, 50),
+               labels= c("FDR > 0.05", "FDR < 0.05", "FDR < 0.0001", "FDR < 1e-10", "FDR < 1e-20", "FDR < 1e-30"),
+               include.lowest = TRUE)
+
+#set equivalent scale between dot plot & transcript plot (zooming in to only space covered by sgRNAs)
+sg_min <- min(test1_GOI$cutsiteLoc) - 100
+#sg_min <- min(filter(test1_GOI, FDR<0.05)$cutsiteLoc) - 100
+sg_max <- max(test1_GOI$cutsiteLoc) + 100
+#sg_max <- max(filter(test1_GOI, FDR<0.05)$cutsiteLoc) + 100
+sg_min0_a <- sg_min - gg_start_a #gg_start is the first coordinate in transcript space
+sg_max0_a <- sg_min0_a+sg_max-sg_min
+sg_min0_b <- sg_min - gg_start_b #gg_start is the first coordinate in transcript space
+sg_max0_b <- sg_min0_b+sg_max-sg_min
+
+#set CRISPR y-axis
+y_min <- round_any(min(filter(test1_GOI, between(cutsiteLoc, sg_min, sg_max))$logFC), 1, f=floor)
+y_max <- round_any(max(filter(test1_GOI, between(cutsiteLoc, sg_min, sg_max))$logFC), 1, f=ceiling)
+
+#make dot plot of CRISPR data
+
+LN <-test1_GOI %>%
+  ggplot(aes(x=cutsiteLoc, y=logFC, color=brks)) +
+  geom_point() +
+  scale_color_manual(values=c("grey","khaki", "darkgoldenrod1","tomato2","violetred","darkmagenta"), name=NULL) +
+  geom_hline(yintercept=0) +
+  theme_minimal() +
+  labs(x="Genomic Coordinates", y="log2FC(proliferation)", title=paste(goi, "test1 Results")) +
+  coord_cartesian(xlim=c(sg_min, sg_max), ylim=c(y_min, y_max), expand=FALSE) + 
+  scale_x_continuous(labels = comma) 
+LN
+
+# 
+# #set up x axis for transcript plot
+gg_breaks_a <- seq(from=gg_st_a, to=gg_e_a, by=gg_by_a)
+gg_labels_a <- paste0(as.character(all_tx@seqnames[1]),":", format(gg_breaks_a, big.mark=",",scientific=FALSE)) 
+gg_breaks_b <- seq(from=gg_st_b, to=gg_e_b, by=gg_by_b)
+gg_labels_b <- paste0(as.character(basic_tx@seqnames[1]),":", format(gg_breaks_b, big.mark=",",scientific=FALSE)) 
+
+#make transcript plot using BASIC transcripts
+gg <- gggenomes(genes=ggbasic) +
+  geom_seq_label() +
+  geom_gene(size=3, intron_shape = c(4,4), 
+            cds_aes = aes(fill="midnightblue"), 
+            rna_aes = aes(fill="palegreen3", alpha=0.5),
+            rna_size = 2) +
+  labs(title=paste(goi, "Basic Transcripts"), y="Transcript IDs") +
+  coord_cartesian(c(sg_min0_b, sg_max0_b), ylim=c(0,nrow(basic_tx_names)+1),expand = FALSE) + 
+  #geom_coverage(aes(z=score), fill="lavenderblush3", offset=-0.6, height=0.3) +
+  scale_x_continuous(name="chr8 coordinates", 
+                     breaks=seq(from=gg_xstart_b, to=gg_xend_b, by=gg_by_b), #if you want to have fewer breaks (too crowded), then just put by=gg_by*2/4/etc here and gg_breaks line
+                     labels=gg_labels_b)
+gg
+
+#make transcript plot using ALL transcripts
+gg_all <- gggenomes(genes=ggall) +
+  geom_seq_label() +
+  geom_gene(size=3, intron_shape = c(4,4), 
+            cds_aes = aes(fill="midnightblue"), 
+            rna_aes = aes(fill="palegreen3", alpha=0.5),
+            rna_size = 2) +
+  labs(title=paste(goi, "All Transcripts"), y="Transcript IDs") +
+  coord_cartesian(xlim=c(sg_min0_a, sg_max0_a), ylim=c(0,nrow(all_tx_names)+1),expand = FALSE) + 
+  scale_x_continuous(name="chr8 coordinates", 
+                     breaks=seq(from=gg_xstart_a, to=gg_xend_a, by=gg_by_a), #if you want to have fewer breaks (too crowded), then just put by=gg_by*2/4/etc here and gg_breaks line
+                     labels=gg_labels_a)
+gg_all
+
+#arrange dot plot and transcript plot together
+fig_all <- ggarrange(LN,gg_all)
+fig_basic <- ggarrange(LN, gg)
+# pdf("test.pdf", width=5, height=9)
+# basic_all <- ggarrange(LN, gg_all, gg, ncol=1, nrow=3)
+# dev.off()
+#ggsave("MYC_test1_All_Transcripts_23-08-25.tiff", plot=fig_all)
+#ggsave("MYC_test1_Basic_Transcripts_23-08-25.tiff", plot=fig_basic)
+```
+
+Putting all 4 datasets together
+```{r}
+all_20D <- rbind(test1_master %>% mutate(test_no="test1") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no), 
+                 test2_master %>% mutate(test_no="test2") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no), 
+                 test4_master %>% mutate(test_no="test4") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no), 
+                 test3_master %>% mutate(test_no="test3") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no))
+
+all_GOI <- all_20D %>%
+  filter(geneName == goi) %>%
+  mutate(log10FDR =-log10(FDR))
+all_GOI$brks <- cut(all_GOI$log10FDR, 
+               breaks=c(0,1.3,4,10, 20, 30, 50),
+               labels= c("FDR > 0.05", "FDR < 0.05", "FDR < 0.0001", "FDR < 1e-10", "FDR < 1e-20", "FDR < 1e-30"),
+               include.lowest = TRUE)
+y_min <- min(filter(all_GOI, between(cutsiteLoc, sg_min, sg_max))$logFC)
+y_min <- ifelse(y_min<0, y_min*1.1, y_min*0.9)
+y_max <- max(filter(all_GOI, between(cutsiteLoc, sg_min, sg_max))$logFC)
+y_max <- ifelse(y_max>0, y_max*1.1, y_max*0.9)
+
+#faceting
+CRISPR_4 <- all_GOI %>%
+  ggplot(aes(x=cutsiteLoc, y=logFC, color=brks)) +
+  geom_point() +
+  scale_color_manual(values=c("grey","khaki", "darkgoldenrod1","tomato2","violetred","darkmagenta"), name=NULL) +
+  geom_hline(yintercept=0) +
+  theme_minimal() +
+  labs(x="Genomic Coordinates", y="log2FC(proliferation)", title=paste(goi, "All Results")) +
+  scale_x_continuous(labels = comma) +
+  coord_cartesian(xlim=c(sg_min, sg_max), ylim=c(y_min, y_max), expand=FALSE, clip = FALSE) + 
+  facet_wrap(~test_no, ncol=1)
+CRISPR_4
+
+fig4_all <- ggarrange(CRISPR_4, gg_all, heights=c(6,3))
+fig4_basic <- ggarrange(CRISPR_4, gg, heights=c(6,3))
+# pdf("test.pdf", width=5, height=9)
+# fig4_both <- ggarrange(CRISPR_4, gg, heights=c(6,3))
+# dev.off()
+#ggsave(paste0(goi, "_AllCRISPR_AllTranscripts.tiff"), plot=fig4_all, height=10, width=6)
+#ggsave(paste0(goi, "_AllCRISPR_BasicTranscripts.tiff"), plot=fig4_basic, height=10, width=6)
+```
+
+Add CRISPR SURF Data to 4 lines + transcript
+```{r}
+ # SURF_test3 <- read_csv("significant_regions_test3.csv") %>% mutate(test_no = "test3")
+ # SURF_test4 <- read_csv("significant_regions_test4.csv") %>% mutate(test_no = "test4")
+ # SURF_test1 <- read_csv("significant_regions_test1.csv") %>% mutate(test_no = "test1")
+ # SURF_test2 <- read_csv("significant_regions_test2.csv") %>% mutate(test_no = "test2")
+ # SURF_all <- rbind(SURF_test3, SURF_test1, SURF_test2, SURF_test4) %>% 
+ #   mutate(Chr = str_replace(Chr, "chrx", "chrX"))
+
+#get coordinate range for goi
+sg_chr <- unique(all_GOI$chr)
+
+#filter SURF for GOI
+SURF_GOI <- SURF_all %>%
+  filter(Chr == sg_chr) %>%
+  filter(between(Start, sg_min, sg_max))
+
+#try combining SURF & EdgeR dfs
+all_combo <- bind_rows(all_GOI, SURF_GOI)
+
+Edge_SURF <- all_combo %>%
+  ggplot() +
+  geom_point(aes(x=cutsiteLoc, y=logFC, color=brks)) +
+  scale_color_manual(values=c("grey","khaki", "darkgoldenrod1","tomato2","violetred","darkmagenta"), name=NULL) +
+  geom_hline(yintercept=0) +
+  theme_minimal() +
+  labs(x="Genomic Coordinates", y="log2FC(proliferation)", title=paste(goi, "All Results"), subtitle = "CRISPR SURF FDR<=0.05") +
+  scale_x_continuous(labels = comma) +
+  geom_rect(aes(xmin=Start, xmax=Stop, ymin=-0.25, ymax=0.25), alpha=0.3, color="slateblue", fill="slategrey") +
+  facet_wrap(~test_no, ncol=1)
+Edge_SURF
+#ggsave(paste0("Graphs/CRISPR_SURF/SURF_EdgeR_", goi,".tiff"), bg="white" ,height=10, width=6)
+
+Edge_SURF_all <- ggarrange(Edge_SURF, gg_all, heights=c(6,3))
+Edge_SURF_basic <- ggarrange(Edge_SURF, gg, heights=c(6,3))
+#ggsave(paste0(goi, "_AllCRISPR_SURF_AllTranscripts.tiff"), plot=Edge_SURF_all, height=10, width=6)
+#ggsave(paste0(goi, "_AllCRISPR_SURF_BasicTranscripts.tiff"), plot=Edge_SURF_basic, height=10, width=6)
+```
+
+
+FOR DOING ALL GENES AT ONCE:
+
+Loop to export all graphs (4 CRISPR + CRISPR SURF + RELICS + transcript + conservation (ggplot) + RNASeq coverage, only first chunk of sgRNAs) at once
+```{r}
+all_20D <- rbind(test1_master %>% mutate(test_no="test1") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no, cpm_0D_avg, raw_0D_avg), 
+                 test2_master %>% mutate(test_no="test2") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no, cpm_0D_avg, raw_0D_avg), 
+                 test4_master %>% mutate(test_no="test4") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no, cpm_0D_avg, raw_0D_avg), 
+                 test3_master %>% mutate(test_no="test3") %>% dplyr::select(guideName,logFC,PValue, FDR, cutsiteLoc, geneName, status, chr, test_no, cpm_0D_avg, raw_0D_avg))
+
+all_genes <- unique(all_20D$geneName)[-c(6,218,286)] #285 genes (#6 is "NA", so remove that)
+chr_set <- c(as.character(1:22), "X", "Y")
+
+SURF_test3 <- read_csv("significant_regions_test3.csv") %>% mutate(test_no = "test3")
+SURF_test4 <- read_csv("significant_regions_test4.csv") %>% mutate(test_no = "test4")
+SURF_test1 <- read_csv("significant_regions_test1.csv") %>% mutate(test_no = "test1")
+SURF_test2 <- read_csv("significant_regions_test2.csv") %>% mutate(test_no = "test2")
+SURF_all <- rbind(SURF_test3, SURF_test1, SURF_test2, SURF_test4) %>%
+   mutate(Chr = str_replace(Chr, "chrx", "chrX"))
+
+RELICS_test3 <- read_delim("Lung_UTR_analysis_finalFS_k15_FS_locations.bed",
+    delim = "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE) %>%
+  rename(Chr = X1, Start = X2, Stop = X3) %>% dplyr::select(-X4, -X5) %>% mutate(test_no = "test3")
+RELICS_test4 <- read_delim("Bladder_UTR_analysis_tryseg_dist25_finalFS_k15_FS_locations.bed",
+    delim = "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE) %>%
+  rename(Chr = X1, Start = X2, Stop = X3) %>% dplyr::select(-X4, -X5) %>% mutate(test_no = "test4")
+RELICS_test1 <- read_delim("test1_UTR_analysis_finalFS_k15_FS_locations.bed",
+    delim = "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE) %>%
+  rename(Chr = X1, Start = X2, Stop = X3) %>% dplyr::select(-X4, -X5) %>% mutate(test_no = "test1")
+RELICS_test2 <- read_delim("Breast_UTR_analysis_finalFS_k15_FS_locations.bed",
+    delim = "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE) %>%
+  rename(Chr = X1, Start = X2, Stop = X3) %>% dplyr::select(-X4, -X5) %>% mutate(test_no = "test2")
+RELICS_all <- rbind(RELICS_test3, RELICS_test1, RELICS_test2, RELICS_test4)
+
+phast <- phastCons100way.UCSC.hg38
+
+gene_no <- 1
+pdf("EdgeR_SURF_RELICS_BasicTx_Cons-gg_Coverage-Zoomed.pdf", width=5, height=9)
+for(gene in all_genes){
+  goi <- gene
+  ensembl_id <- ensembl_map_2 %>% filter(hgnc_symbol == goi)%>% filter(chromosome_name %in% chr_set) %>% pull(ensembl_gene_id)
+  ###BASIC TRANSCRIPTS###
+
+    ##set up df of cds/intron/exon coordinates to start
+    gene_id <- grep(ensembl_id, names(transcriptsBy(basic_txdb, by="gene")), value=TRUE)
+    basic_tx <- transcriptsBy(basic_txdb, by = "gene")[[gene_id]]
+    basic_tx_id <- mcols(basic_tx)$tx_id
+    basic_tx_names <- as.data.frame(basic_tx)[,6:7]
+    
+    basic_exons <- exonsBy(basic_txdb, "tx")[basic_tx_id]
+    basic_introns <- intronsByTranscript(basic_txdb)[basic_tx_id]
+    basic_exin <- bind_rows(as.data.frame(basic_exons) %>% mutate(type="exon"), as.data.frame(basic_introns) %>% mutate(type="intron")) %>%
+      dplyr::select(group_name, seqnames, start, end, width, strand, type)
+    
+    basic_cds <- as.data.frame(cds_b[names(cds_b) %in% basic_tx_id]) %>%
+      dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+      mutate(type = "CDS")
+    basic_3utr <- as.data.frame(threeUTR_b[names(threeUTR_b) %in% basic_tx_id]) %>%
+      dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+      mutate(type = "utr3")
+    basic_5utr <- as.data.frame(fiveUTR_b[names(fiveUTR_b) %in% basic_tx_id]) %>%
+      dplyr::select(group_name, seqnames, start, end, width, strand) %>%
+      mutate(type = "utr5")
+    basic_txinfo <- bind_rows(basic_cds, basic_3utr, basic_5utr, basic_exin) %>%
+      dplyr::select(group_name, start, end, strand, type) %>%
+      rowwise %>%
+      mutate(seq_id = basic_tx_names %>% filter(tx_id == group_name) %>% pull(tx_name))
+    
+    
+    ##now make gene, mRNA, cds, exon rows as correct for gggenomes
+    #make exon rows: each exon for each seq_id is a separate row, no intron info
+    ggbasic_exons <- basic_txinfo %>% filter(type=="exon") %>% mutate(introns = NA)
+    
+    #make cds rows: one row for each seq_id that has the total CDS length used by that seq_id, and the introns relative to the CDS start position
+    ggbasic_cds <- basic_txinfo %>% filter(type=="CDS") %>%
+      group_by(seq_id) %>%
+      summarize(start=min(start), 
+                end=max(end), 
+                strand=strand[1], 
+                type="CDS")
+    ##adding introns to cds df
+    cds_df <- NULL
+    for (i in 1:nrow(ggbasic_cds)) {
+      df <- ggbasic_cds
+      seq_i <- df$seq_id[i]
+      start <- df$start[i]
+      end <- df$end[i]
+      cds_width <- end-start
+      introns_start <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(start)
+      introns_end <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(end)
+      introns <- c(introns_start, introns_end) - start
+      introns <- introns[introns>=0]
+      introns <- introns[introns<=cds_width]
+      introns <- sort(introns)
+      
+      new_row <- tibble(
+        seq_id = seq_i, 
+        start=start, 
+        end=end, 
+        introns = list(introns), 
+        strand=df$strand[i], 
+        type="CDS"
+      )
+      cds_df <- rbind(cds_df, new_row)
+    }
+    ggbasic_cds <- cds_df
+    
+    #make mRNA row: one row for each seq_id that has the total mRNA length used by that seq_id, as defined by the exons, and the introns relative to the mRNA start position
+    ggbasic_mRNA <- basic_txinfo %>% filter(type=="exon") %>%
+      group_by(seq_id) %>%
+      summarize(start=min(start), 
+                end=max(end), 
+                strand=strand[1], 
+                type="mRNA")
+    ##adding introns to mRNA df
+    mRNA_df <- NULL
+    for (i in 1:nrow(ggbasic_mRNA)) {
+      df <- ggbasic_mRNA
+      seq_i <- df$seq_id[i]
+      start <- df$start[i]
+      end <- df$end[i]
+      introns_start <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(start)
+      introns_end <- basic_txinfo %>% filter(seq_id == seq_i, type=="intron") %>% pull(end)
+      introns <- c(introns_start, introns_end) - start
+      introns <- introns[introns>=0]
+      introns <- sort(introns)
+      
+      new_row <- tibble(
+        seq_id = seq_i, 
+        start=start, 
+        end=end, 
+        introns = list(introns), 
+        strand=df$strand[i], 
+        type="mRNA"
+      )
+      mRNA_df <- rbind(mRNA_df, new_row)
+    }
+    ggbasic_mRNA <- mRNA_df
+    
+    #make gene row: one row for each seq_id, but all have the same total length/size (essentially setting the x-axis)
+    ggbasic_gene <- basic_txinfo %>%
+      group_by(strand) %>%
+      summarize(start=min(start), 
+                end=max(end), 
+                strand=strand[1], 
+                type="gene",
+                introns=NA)
+    ggbasic_gene <- do.call("rbind", replicate(length(unique(basic_txinfo$seq_id)),ggbasic_gene, simplify = FALSE)) %>%
+      mutate(seq_id = unique(basic_txinfo$seq_id))
+    
+    ##put together for gggenomes
+    ggbasic <- rbind(ggbasic_gene, ggbasic_mRNA, ggbasic_cds, ggbasic_exons %>% dplyr::select(-group_name))
+    
+  ###CONSERVATION###
+    #make GRanges object with windows of conservation scores across transcript space
+    full_tx <- GenomicRanges::reduce(basic_tx)
+    full_windows <- slidingWindows(full_tx,width = 1, step=1)[[1]]
+    full_windows$score <- score(phast, full_windows)
+    cons_df <- as.data.frame(full_windows) %>%
+      mutate(seq_id = tail(sort(basic_tx$tx_name), 1)) #now have df with seq_id, start, end, score
+    
+  ###GET EDGER DATA###
+    all_GOI <- all_20D %>%
+      filter(geneName == goi) %>%
+      mutate(log10FDR =-log10(FDR))
+    all_GOI$brks <- cut(all_GOI$log10FDR, 
+                   breaks=c(0,1.3,4,10, 20, 30, 50),
+                   labels= c("FDR > 0.05", "FDR < 0.05", "FDR < 0.0001", "FDR < 1e-10", "FDR < 1e-20", "FDR < 1e-30"),
+                   include.lowest = TRUE)
+    all_GOI$coverage <- cut(all_GOI$raw_0D_avg, 
+               breaks=c(0,50,150,300, max(all_GOI$raw_0D_avg)),
+               labels= c("0-50 reads", "50-150 reads", "150-300 reads", "300+ reads"),
+               include.lowest = TRUE)
+    
+  ###SETTING AXES###
+    #find gaps, set x axis to only before first large gap
+      sg_min <- min(all_GOI$cutsiteLoc)
+      sg_max <- max(all_GOI$cutsiteLoc)
+      sg_width <- sg_max - sg_min
+      max_gap <- 0.20*sg_width
+      all_sg <- sort(all_GOI$cutsiteLoc)
+      gap_starts <- c()
+      gap_ends <- c()
+      for (i in c(1:(length(all_sg)-1))) {
+        a <- all_sg[i]
+        b <- all_sg[i+1]
+        gap_start <- if(b-a>max_gap){a}
+        gap_end <- if(b-a>max_gap){b}
+        gap_starts <- c(gap_starts, c(gap_start))
+        gap_ends <- c(gap_ends, c(gap_end))
+      }
+      x_range <- c()
+      if(is.null(gap_starts)){x_range <- c(sg_min-100, sg_max+100)} else if(unique(basic_txinfo$strand)== "+"){x_range <- c(sg_min-100, gap_starts[1]+100)} else if(unique(basic_txinfo$strand)== "-"){x_range <- c(tail(gap_ends,1)-100,sg_max+100)}
+    
+    
+    #set up x axis
+    ##actual start-stop of transcript in chromosomal space
+    gg_start_b <- min(ggbasic$start)
+    gg_end_b <- max(ggbasic$end)
+    ##the range you want to be shown in chromosomal space
+    x_min <- x_range[1]
+    x_max <- x_range[2]
+    x_width <- x_max-x_min
+    ##the range you want to be shown in gggenomes 0-based space
+    x_min0 <- x_min - gg_start_b
+    x_max0 <- x_min0 + x_width
+    
+    #set where along the x-axis you want ticks to show based on range
+    if(between(x_width, 2501, 10000)){
+      gg_st_b <-round_any(x_min, 1000, f=floor)
+      gg_e_b <- round_any(x_max, 1000, f=ceiling)
+      gg_by_b <- 1000} else if(between(x_width, 1, 1000)){
+      gg_st_b <-round_any(x_min, 100, f=floor)
+      gg_e_b <- round_any(x_max, 100, f=ceiling)
+      gg_by_b <- 100} else if(between(x_width, 10000, 100000)){
+      gg_st_b <-round_any(x_min, 10000, f=floor)
+      gg_e_b <- round_any(x_max, 10000, f=ceiling)
+      gg_by_b <- 10000} else if(between(x_width, 1000, 2500)){
+      gg_st_b <- round_any(x_min, 500, f=floor)
+      gg_e_b <- round_any(x_max, 500, f=ceiling)
+      gg_by_b <- 500}
+    gg_breaks_b <- seq(from=gg_st_b, to=gg_e_b, by=gg_by_b)
+    #format the x-axis ticks as proper coordinates instead of 0-based values
+    gg_labels_b <- paste0(as.character(basic_tx@seqnames[1]),":", format(gg_breaks_b, big.mark=",",scientific=FALSE)) 
+    # #0-based gggenomes coordinates for x axis limits/breaks
+    # gg_xstart_b <- gg_breaks_b[1] - gg_start_b
+    # gg_xend_b <- tail(gg_breaks_b,1) - gg_breaks_b[1] + gg_xstart_b
+    
+    y_min <- min(filter(all_GOI, between(cutsiteLoc, x_min, x_max))$logFC)
+    y_min <- ifelse(y_min<0, y_min*1.1, y_min*0.9)
+    y_max <- max(filter(all_GOI, between(cutsiteLoc, x_min, x_max))$logFC)
+    y_max <- ifelse(y_max>0, y_max*1.1, y_max*0.9)
+
+  ###SET UP RNASEQ COVERAGE###
+    cov_gr <- full_tx
+    start(cov_gr) <- x_range[1]
+    end(cov_gr) <- x_range[2]
+    param <- ScanBamParam(flag=scanBamFlag(isDuplicate=FALSE, isSecondaryAlignment=FALSE), 
+                      which=cov_gr) 
+    
+    cvg_result = lapply(bamfls, function(x){
+      bf = BamFile(x)
+      cvg = coverage(readGAlignments(bf, param=param))
+      
+      ans = as.numeric(cvg[cov_gr,][[1]])
+      # if(as.character(strand(cov_gr))=="-"){
+      #     ans = ans[length(ans):1]}
+      ans})
+    
+    cvg_result<- as.data.frame(do.call(cbind, cvg_result))
+    colnames(cvg_result)<- c("test1_1", "test1_2", "test2_1", "test2_2", "test3_1", "test3_2", "test4")
+    # cvg_result_reps<- cvg_result %>%
+    #   mutate(bp = start(cov_gr):end(cov_gr)) %>%
+    #   pivot_longer(cols= c("test1_1", "test1_2", "test2_1", "test2_2", "test3_1", "test3_2", "test4"),
+    #                names_to = "test_no",
+    #                values_to = "cvg_score")
+    cvg_result <- cvg_result %>% rowwise() %>%
+      mutate(test1 = mean(c(test1_1, test1_2)), 
+             test2 = mean(c(test2_1, test2_2)), 
+             test3 = mean(c(test3_1, test3_2))) %>% ungroup() %>%
+      dplyr::select(test1, test2, test3, test4) %>%
+      mutate(bp = start(cov_gr):end(cov_gr)) %>%
+      pivot_longer(cols= c("test1", "test2", "test3", "test4"), 
+                   names_to = "test_no", 
+                   values_to = "cvg_score")
+      
+    
+  #make transcript plot using BASIC transcripts
+  gg <- gggenomes(genes=ggbasic, feats=cons_df) +
+    geom_seq_label() +
+    geom_gene(size=3, intron_shape = c(4,4), 
+              cds_aes = aes(fill="midnightblue"), 
+              rna_aes = aes(fill="palegreen3", alpha=0.5),
+              rna_size = 2) +
+    labs(title=paste(goi, "Basic Transcripts"), y="Transcript IDs") +
+    coord_cartesian(c(x_min0, x_max0), ylim=c(0,nrow(basic_tx_names)+1),expand = FALSE) + 
+    scale_x_continuous(name="chr8 coordinates", 
+                       breaks=gg_breaks_b - gg_start_b, 
+                       labels=gg_labels_b)
+  
+  #PHASTCONS conservation ggplot
+  p_cons <- cons_df %>%
+    ggplot(aes(x=start, y=score)) +
+      geom_area(fill="lavenderblush3") +
+      scale_x_continuous(labels = comma) +
+      coord_cartesian(xlim=c(x_range[1], x_range[2]), expand=FALSE) +
+      theme_classic() +
+      scale_y_continuous(breaks=c(0,1)) +
+      theme(legend.position = "none") +
+      labs(x="", y="")
+    
+  
+  #scatterplot with coverage, SURF, & RELICS
+    ##filter SURF for GOI
+    sg_chr <- unique(all_GOI$chr)
+    SURF_GOI <- SURF_all %>%
+      filter(Chr == sg_chr) %>%
+      filter(between(Start, sg_min, sg_max)) %>%
+      mutate(Program = "CRISPR_SURF")
+    RELICS_GOI <- RELICS_all %>%
+      filter(Chr == sg_chr) %>%
+      filter(between(Start, sg_min, sg_max)) %>%
+      mutate(Program = "RELICS")
+    ##combining SURF & EdgeR dfs
+    all_combo <- bind_rows(all_GOI, SURF_GOI, RELICS_GOI)
+    
+   
+    CRISPR_4 <- all_combo %>%
+      ggplot() +
+      geom_point(aes(x=cutsiteLoc, y=logFC, color=brks, shape=coverage)) +
+      scale_color_manual(values=c("grey","khaki", "darkgoldenrod1","tomato2","violetred","darkmagenta"), name=NULL) +
+      geom_hline(yintercept=0) +
+      theme_minimal() +
+      labs(x="Genomic Coordinates", y="log2FC(proliferation)", title=paste(goi, "All Results")) +
+      scale_x_continuous(labels = comma) +
+      coord_cartesian(xlim=c(x_range[1], x_range[2]), ylim=c(y_min, y_max), expand=FALSE, clip = FALSE) + 
+      geom_rect(data= . %>% filter(Program == "CRISPR_SURF", Direction == "positive"),aes(xmin=Start, xmax=Stop, ymin=0, ymax=0.4), alpha=0.3, color="slateblue", fill="slategrey") +
+      geom_rect(data= . %>% filter(Program == "CRISPR_SURF", Direction == "negative"),aes(xmin=Start, xmax=Stop, ymin=-0.4, ymax=0), alpha=0.3, color="slateblue", fill="slategrey") +
+      geom_rect(data= . %>% filter(Program == "RELICS"),aes(xmin=Start, xmax=Stop, ymin=-0.2, ymax=0.2), alpha=0.3, color="orchid1", fill="plum") +
+      facet_wrap(~test_no, ncol=1)
+   
+  #RNAseq coverage plot
+    p_cvg <- cvg_result %>%
+      ggplot(aes(x=bp, y=cvg_score, fill=test_no)) +
+      geom_area() +
+      #scale_fill_manual(values=c("skyblue2","midnightblue", "darkseagreen","seagreen","mediumpurple2","mediumorchid3", "chocolate2"))+
+      scale_fill_manual(values=c("skyblue2", "darkseagreen","mediumpurple2", "chocolate2"))+
+      scale_x_continuous(labels = comma) +
+      coord_cartesian(xlim=c(x_range[1], x_range[2]), expand=FALSE, clip = FALSE) +
+      theme_classic() +
+      theme(legend.position = "none") +
+      labs(x="", y="") +
+      facet_grid(rows=vars(test_no), scales="free_y")
+    p_cvg <- p_cvg +
+      facetted_pos_scales(y=list(
+        test_no== "test3" ~scale_y_continuous(breaks=max(filter(cvg_result, test_no=="test3")$cvg_score)), 
+        test_no== "test1" ~scale_y_continuous(breaks=max(filter(cvg_result, test_no=="test1")$cvg_score)), 
+        test_no== "test2" ~scale_y_continuous(breaks=max(filter(cvg_result, test_no=="test2")$cvg_score)), 
+        test_no== "test4" ~scale_y_continuous(breaks=max(filter(cvg_result, test_no=="test4")$cvg_score))
+      ))
+    
+    
+  #end results 
+    fig4_basic <- ggarrange(CRISPR_4, gg, p_cons, p_cvg, heights=c(6,3,0.6,3), widths = c(7,7,7,7))
+    gene_no <- gene_no + 1
+    print(paste0(gene_no, ": ",gene))
+}
+dev.off()
+```
+
+
